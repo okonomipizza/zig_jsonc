@@ -279,13 +279,12 @@ pub const JsoncParser = struct {
 
             try object.put(key.string, value);
 
-            if (self.getChar(self.idx)) |char| {
-                // Last value was string.
-                // We need to skip '"' token.
-                if (char == '"') {
-                    try self.skipWhiteAndComments();
+            switch (value) {
+                .string => {
                     try self.advanceN(1);
-                }
+                },
+                .object, .array => {},
+                else => {}
             }
 
             if (self.getChar(self.idx)) |char| {
@@ -722,4 +721,54 @@ test "Parse object with multi-line comment" {
     try testing.expect(parsed == .object);
     try testing.expectEqualStrings("zig", parsed.object.get("lang").?.string);
     try testing.expectEqual(0.14, parsed.object.get("version").?.float);
+}
+
+test "Parse nested object" {
+    const input = 
+        \\{
+        \\    "music": {
+        \\        "theme": {
+        \\            "color": "#8a2be2"
+        \\        }
+        \\    },
+        \\    "messages": [
+        \\        "message1",
+        \\        "message2",
+        \\        "message3"
+        \\    ]
+        \\}
+    ;
+
+    const allocator = testing.allocator;
+
+    var parser = try JsoncParser.init(allocator, input);
+    defer parser.deinit();
+
+    const parsed = parser.parse() catch |err| {
+        std.debug.print("{c}\n", .{parser.jsonc_str[parser.idx]});
+        return err;
+    };
+
+    try testing.expect(parsed == .object);
+    const music = parsed.object.get("music").?;
+    try testing.expect(music == .object);
+    
+    const theme = music.object.get("theme").?;
+    try testing.expect(theme == .object);
+
+    const color = theme.object.get("color").?;
+    try testing.expectEqualStrings("#8a2be2", color.string);
+
+    const messages = parsed.object.get("messages").?;
+    try testing.expect(messages == .array);
+
+    try testing.expectEqual(3, messages.array.items.len);
+
+    const first_msg = messages.array.items[0];
+    const second_msg = messages.array.items[1];
+    const third_msg = messages.array.items[2];
+
+    try testing.expectEqualStrings("message1", first_msg.string);
+    try testing.expectEqualStrings("message2", second_msg.string);
+    try testing.expectEqualStrings("message3", third_msg.string);
 }
