@@ -40,22 +40,6 @@
             inherit system;
           };
 
-          # packages.${system} = let
-          #   mkArgs = optimize: {
-          #     inherit optimize;
-          #
-          #     revision = self.shortRev or self.dirtyShortRev or "dirty";
-          #     zig = zig.packages.${system}."0.15.1";
-          #   };
-          # in rec {
-          #   iroha-debug = pkgs.callPackage ./package.nix (mkArgs "Debug");
-          #   iroha-releasesafe = pkgs.callPackage ./package.nix (mkArgs "ReleaseSafe");
-          #   iroha-releasefast = pkgs.callPackage ./package.nix (mkArgs "ReleaseFast");
-          #
-          #   jsonc-fmt = jsonc-fmt-releasefast;
-          #   default = jsonc-fmt;
-          # };
-
           formatter.${system} = pkgs.alejandra;
         }
       ) (builtins.attrNames zig.packages)
