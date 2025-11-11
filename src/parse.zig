@@ -1,31 +1,53 @@
 const std = @import("std");
 
+/// Errors that occurs during parsing
 pub const ParseError = error{
-    // String parsing errors
-    UnterminatedString,
-    UnexpectedToken,
-    UnexpectedError,
-    SyntaxError,
+    // Invalid characeter and tokens
     InvalidToken,
     InvalidNumber,
-    EmptyJsonString,
     UnexpectedCharacter,
-    EOF,
-    OutOfMemory,
-    UnclosedComment,
-    MissingClosingBracket,
-    EmptyElement,
+    UnexpectedToken,
+
+    // Syntax errors
+    UnterminatedString,
     UnterminatedArray,
     UnterminatedObject,
-    BeforeStart,
+    UnclosedComment,
+
+    IncompleteKeyValuePair,
+
+    MissingComma,
+
+    /// Returned when the parser is given an empty JSON string
+    EmptyJsonString,
+
+    /// Returned when the array or object has empty content
+    EmptyElemnt,
+
+    IndexOutOfBounds,
+
+    // Memory related errors
+    OutOfMemory,
 };
 
 pub const ValueRange = struct { start: usize, end: usize };
 pub const PositionMap = std.AutoHashMap(usize, ValueRange);
 pub const CommentRanges = std.ArrayList(ValueRange);
 
+pub const ParseResult = union(enum) {
+    ok: std.json.Value,
+    err: ParseErrorInfo,
+
+    pub const ParseErrorInfo = struct {
+        kind: ParseError,
+        row: usize,
+        col: usize,
+        message: []const u8,
+    };
+};
+
 pub const JsoncParser = struct {
-    /// Original json with Comments text
+    /// Original Json with Comments text
     jsonc_str: []const u8,
     /// Current offset
     idx: usize,
@@ -60,55 +82,99 @@ pub const JsoncParser = struct {
         return self.arena.allocator();
     }
 
-    pub fn parse(self: *Self) ParseError!std.json.Value {
+    pub fn parse(self: *Self) ParseResult {
+        if (self.jsonc_str.len == 0) {
+            return ParseResult{ .err = .{
+                .kind = ParseError.EmptyJsonString,
+                .row = 0,
+                .col = 0,
+                .message = "Empty JSON string",
+            } };
+        }
+
+        const result = self.parseRecursive() catch |err| {
+            return ParseResult{ .err = .{
+                .kind = err,
+                .row = self.last_error_row,
+                .col = self.last_error_col,
+                .message = self.last_error_message,
+            } };
+        };
+
+        return ParseResult{ .ok = result };
+    }
+
+    fn parseRecursive(self: *Self) ParseError!std.json.Value {
+        const row = self.row;
+        const col = self.col;
+
         if (self.jsonc_str.len == 0) return ParseError.EmptyJsonString;
         while (self.idx < self.jsonc_str.len) : (try self.advanceN(1)) {
             const char = self.getChar(self.idx) orelse continue;
-            if(isWhiteSpace(char)) continue;
+            if (isWhiteSpace(char)) continue;
             switch (char) {
-                'n' => return self.parseLiteral("null"),
-                't' => return self.parseLiteral("true"),
-                'f' => return self.parseLiteral("false"),
+                'n' => return self.parseLiteral(.null),
+                't' => return self.parseLiteral(.true),
+                'f' => return self.parseLiteral(.false),
                 '"' => return self.parseString(),
                 '[' => return self.parseArray(),
                 '{' => return self.parseObject(),
                 '0'...'9', '-', 'e', '.' => return self.parseNumber(),
                 else => return self.recordError(
                     ParseError.UnexpectedCharacter,
+                    row,
+                    col,
                     "Unexpected character",
                 ),
             }
         }
-
-        return ParseError.SyntaxError;
+        return self.recordError(ParseError.EmptyJsonString, row, col, "No valid JSON value found");
     }
 
+    const LiteralType = enum {
+        null,
+        true,
+        false,
+
+        fn toString(self: LiteralType) []const u8 {
+            return switch (self) {
+                .null => "null",
+                .true => "true",
+                .false => "false",
+            };
+        }
+    };
+
     /// Parse json value 'null', 'true' and 'false'.
-    fn parseLiteral(self: *Self, expected: []const u8) ParseError!std.json.Value {
+    fn parseLiteral(self: *Self, literal_type: LiteralType) ParseError!std.json.Value {
+        const row = self.row;
+        const col = self.col;
+
+        const expected = literal_type.toString();
+
         // Too short for the expected token.
         if (self.idx + expected.len > self.jsonc_str.len) {
-            return ParseError.InvalidToken;
+            return self.recordError(ParseError.InvalidToken, row, col, "Invalid token");
         }
 
         const maybe_literal = self.jsonc_str[self.idx .. self.idx + expected.len];
         if (!std.mem.eql(u8, maybe_literal, expected)) {
-            return self.recordError(ParseError.InvalidToken, "Invalid token");
+            return self.recordError(ParseError.InvalidToken, row, col, "Invalid token");
         }
 
         try self.advanceN(expected.len - 1);
 
-        if (std.mem.eql(u8, expected, "null")) {
-            return std.json.Value{ .null = {} };
-        } else if (std.mem.eql(u8, expected, "true")) {
-            return std.json.Value{ .bool = true };
-        } else if (std.mem.eql(u8, expected, "false")) {
-            return std.json.Value{ .bool = false };
-        } else {
-            return self.recordError(ParseError.UnexpectedToken, "Unexpected character");
-        }
+        return switch (literal_type) {
+            .null => std.json.Value{ .null = {} },
+            .true => std.json.Value{ .bool = true },
+            .false => std.json.Value{ .bool = false },
+        };
     }
 
     fn parseString(self: *Self) ParseError!std.json.Value {
+        const row = self.row;
+        const col = self.col;
+
         const alloc = self.allocator();
         var list = try std.ArrayList(u8).initCapacity(alloc, 64);
 
@@ -116,22 +182,46 @@ pub const JsoncParser = struct {
         try self.advanceN(1);
 
         while (true) : (self.advanceN(1) catch {
-            return self.recordError(ParseError.UnterminatedString, "Unterminated string");
+            return self.recordError(ParseError.UnterminatedString, row, col, "Unterminated string");
         }) {
             const char = self.getChar(self.idx) orelse {
                 break;
             };
+            // JSON strings cannot contain unescaped newlines
+            if (char == '\n' or char == '\r') {
+                return self.recordError(ParseError.UnterminatedString, row, self.col - 1, "Unterminated string");
+            }
+
             if (char == '"') {
                 return std.json.Value{ .string = list.items };
+            } else if (char == '\\') {
+                // Handle escape sequences
+                try self.advanceN(1);
+                const next_char = self.getChar(self.idx) orelse {
+                    return self.recordError(ParseError.UnterminatedString, row, col, "Unterminated string");
+                };
+                switch (next_char) {
+                    '"', '\\', '/' => try list.append(alloc, next_char),
+                    'n' => try list.append(alloc, '\n'),
+                    't' => try list.append(alloc, '\t'),
+                    'r' => try list.append(alloc, '\r'),
+                    else => {
+                        try list.append(alloc, '\\');
+                        try list.append(alloc, next_char);
+                    },
+                }
             } else {
                 try list.append(alloc, char);
             }
         }
 
-        return self.recordError(ParseError.UnterminatedString, "Unterminated string");
+        return self.recordError(ParseError.UnterminatedString, row, col, "Unterminated string");
     }
 
     fn parseNumber(self: *Self) ParseError!std.json.Value {
+        const col = self.col;
+        const row = self.row;
+
         const alloc = self.allocator();
         var bytes = try std.ArrayList(u8).initCapacity(alloc, 64);
         defer bytes.deinit(alloc);
@@ -185,22 +275,24 @@ pub const JsoncParser = struct {
             }
         }
 
-        if (bytes.items.len == 0) return self.recordError(ParseError.InvalidNumber, "Invalid number");
+        if (bytes.items.len == 0) return self.recordError(ParseError.InvalidNumber, row, col, "Invalid number");
 
         if (has_dot or has_e) {
             const float_val = std.fmt.parseFloat(f64, bytes.items) catch {
-                return ParseError.SyntaxError;
+                return self.recordError(ParseError.InvalidNumber, row, col, "Invalid number");
             };
             return std.json.Value{ .float = float_val };
         } else {
             const int_val = std.fmt.parseInt(i64, bytes.items, 10) catch {
-                return ParseError.SyntaxError;
+                return self.recordError(ParseError.InvalidNumber, row, col, "Invalid number");
             };
             return std.json.Value{ .integer = int_val };
         }
     }
 
     fn parseArray(self: *Self) ParseError!std.json.Value {
+        const row = self.row;
+        const col = self.col;
         const alloc = self.allocator();
         var array = std.json.Array.init(alloc);
         errdefer array.deinit();
@@ -210,7 +302,7 @@ pub const JsoncParser = struct {
         var comma = true;
 
         while (self.idx < self.jsonc_str.len) : (self.advanceN(1) catch {
-            return self.recordError(ParseError.MissingClosingBracket, "] token missing");
+            return self.recordError(ParseError.UnterminatedArray, row, col, "Array is not closed");
         }) {
             const char = self.getChar(self.idx) orelse {
                 break;
@@ -223,13 +315,13 @@ pub const JsoncParser = struct {
             } else if (char == ',') {
                 // No element between ',' is not allowed.
                 // ex) [a, , c]
-                if (comma) return ParseError.EmptyElement;
+                if (comma) return self.recordError(ParseError.EmptyElemnt, self.row, self.col, "Empty content of array is not allowed");
                 comma = true;
                 try self.skipWhiteAndComments();
             } else {
                 if (comma) comma = false;
-                const parsed = self.parse() catch {
-                    return ParseError.UnterminatedArray;
+                const parsed = self.parseRecursive() catch {
+                    return self.recordError(ParseError.UnterminatedArray, row, col, "Array is not closed");
                 };
                 try array.append(parsed);
                 if (parsed == .string) {
@@ -240,7 +332,7 @@ pub const JsoncParser = struct {
             }
         }
 
-        return ParseError.UnterminatedArray;
+        return self.recordError(ParseError.UnterminatedArray, row, col, "Array is not closed");
     }
 
     fn parseObject(self: *Self) ParseError!std.json.Value {
@@ -257,7 +349,11 @@ pub const JsoncParser = struct {
             // Check for empty elements in object after key-value pair
             // ex) { "key": "value", , "key2": "value2" }
             if (self.getChar(self.idx) == ',') {
-                return ParseError.EmptyElement;
+                return self.recordError(ParseError.EmptyElemnt, self.row, self.col, "Empty content of object is not allowed");
+            }
+
+            if (self.getChar(self.idx) != '"') {
+                return self.recordError(ParseError.IncompleteKeyValuePair, self.row, self.col, "Invalid key string");
             }
 
             const key = try self.parseString();
@@ -270,12 +366,12 @@ pub const JsoncParser = struct {
                     try self.advanceN(1);
                 }
             }
-            if (self.getChar(self.idx) != ':') return error.SyntaxError;
+            if (self.getChar(self.idx) != ':') return self.recordError(ParseError.IncompleteKeyValuePair, self.row, self.col, "\":\" is missing after key of object");
 
             try self.skipWhiteAndComments();
             try self.advanceN(1);
 
-            const value = try self.parse();
+            const value = try self.parseRecursive();
 
             try object.put(key.string, value);
 
@@ -284,7 +380,7 @@ pub const JsoncParser = struct {
                     try self.advanceN(1);
                 },
                 .object, .array => {},
-                else => {}
+                else => {},
             }
 
             if (self.getChar(self.idx)) |char| {
@@ -300,6 +396,8 @@ pub const JsoncParser = struct {
             }
 
             if (self.getChar(self.idx) == '}') break;
+
+            return self.recordError(ParseError.MissingComma, self.row, self.col, "Missing \",\" after value");
         }
 
         return std.json.Value{ .object = object };
@@ -331,15 +429,15 @@ pub const JsoncParser = struct {
                     self.advanceN(2) catch return;
                     break :blk false;
                 } else {
-                    return self.recordError(ParseError.InvalidToken, "Invalid Token for Comment open");
+                    return self.recordError(ParseError.InvalidToken, self.row, self.col, "Invalid Token for Comment open");
                 }
             }
             return;
         };
 
         while (true) : (self.advanceN(1) catch |err| {
-            if (err == ParseError.EOF and !isSingleLineComment) {
-                return self.recordError(ParseError.UnclosedComment, "Comments should be closed with '*/'");
+            if (err == ParseError.IndexOutOfBounds and !isSingleLineComment) {
+                return self.recordError(ParseError.UnclosedComment, self.row, self.col, "Comments should be closed with '*/'");
             } else {
                 break;
             }
@@ -370,15 +468,16 @@ pub const JsoncParser = struct {
     fn advanceN(self: *Self, n: usize) ParseError!void {
         const new_idx = self.idx + n;
         if (new_idx >= self.jsonc_str.len) {
-            return ParseError.EOF;
+            return self.recordError(ParseError.IndexOutOfBounds, self.row, self.col, "An unexpected boundary crossing occurred during parsing");
         }
         self.idx = new_idx;
+        // TODO Add code to update self.row and self.col
         self.updatePosition();
     }
 
     fn retreat(self: *Self) ParseError!void {
         if (self.idx == 0) {
-            return ParseError.BeforeStart;
+            return self.recordError(ParseError.IndexOutOfBounds, self.row, self.col, "An unexpected boundary crossing occurred during parsing");
         }
         self.idx -= 1;
         self.updatePositionBackward();
@@ -393,7 +492,6 @@ pub const JsoncParser = struct {
         }
     }
 
-    //TODO
     fn updatePositionBackward(self: *Self) void {
         const current_char = self.jsonc_str[self.idx];
         if (current_char == '\n') {
@@ -409,6 +507,7 @@ pub const JsoncParser = struct {
             self.col -= 1;
         }
     }
+
     /// Get char at designated offset in original jsonc string.
     fn getChar(self: Self, position: usize) ?u8 {
         if (position >= self.jsonc_str.len) return null;
@@ -430,9 +529,9 @@ pub const JsoncParser = struct {
         };
     }
 
-    fn recordError(self: *Self, err: ParseError, message: []const u8) ParseError {
-        self.last_error_row = self.row;
-        self.last_error_col = self.col;
+    fn recordError(self: *Self, err: ParseError, row: usize, col: usize, message: []const u8) ParseError {
+        self.last_error_row = row + 1;
+        self.last_error_col = col + 1;
         self.last_error_message = message;
         return err;
     }
@@ -447,9 +546,10 @@ test "Parse null" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
 
-    try testing.expect(parsed == .null);
+    try testing.expect(result.ok == .null);
 }
 
 test "Parse null failed" {
@@ -460,9 +560,11 @@ test "Parse null failed" {
     defer parser.deinit();
 
     const result = parser.parse();
+    try testing.expect(result == .err);
 
-    try testing.expectError(ParseError.InvalidToken, result);
-    try testing.expectEqualStrings("Invalid token", parser.last_error_message);
+    try testing.expectEqual(ParseError.InvalidToken, result.err.kind);
+    try testing.expectEqual(1, result.err.row);
+    try testing.expectEqual(1, result.err.col);
 }
 
 test "Parse true" {
@@ -472,10 +574,11 @@ test "Parse true" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
 
-    try testing.expect(parsed == .bool);
-    try testing.expect(parsed.bool == true);
+    try testing.expect(result.ok == .bool);
+    try testing.expect(result.ok.bool == true);
 }
 
 test "Parse false" {
@@ -485,10 +588,11 @@ test "Parse false" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
 
-    try testing.expect(parsed == .bool);
-    try testing.expect(parsed.bool == false);
+    try testing.expect(result.ok == .bool);
+    try testing.expect(result.ok.bool == false);
 }
 
 test "Parse string" {
@@ -498,10 +602,11 @@ test "Parse string" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
 
-    try testing.expect(parsed == .string);
-    try testing.expectEqualStrings("Hello world", parsed.string);
+    try testing.expect(result.ok == .string);
+    try testing.expectEqualStrings("Hello world", result.ok.string);
 }
 
 test "Parse string failed" {
@@ -512,9 +617,11 @@ test "Parse string failed" {
     defer parser.deinit();
 
     const result = parser.parse();
+    try testing.expect(result == .err);
 
-    try testing.expectError(ParseError.UnterminatedString, result);
-    try testing.expectEqualStrings("Unterminated string", parser.last_error_message);
+    try testing.expectEqual(ParseError.UnterminatedString, result.err.kind);
+    try testing.expectEqual(1, result.err.row);
+    try testing.expectEqual(1, result.err.col);
 }
 
 test "Parse integer" {
@@ -524,10 +631,11 @@ test "Parse integer" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
 
-    try testing.expect(parsed == .integer);
-    try testing.expect(parsed.integer == 1234567890);
+    try testing.expect(result.ok == .integer);
+    try testing.expectEqual(1234567890, result.ok.integer);
 }
 
 test "Parse negative integer" {
@@ -537,10 +645,11 @@ test "Parse negative integer" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
 
-    try testing.expect(parsed == .integer);
-    try testing.expectEqual(-1234567890, parsed.integer);
+    try testing.expect(result.ok == .integer);
+    try testing.expectEqual(-1234567890, result.ok.integer);
 }
 
 test "Parse fraction" {
@@ -550,10 +659,11 @@ test "Parse fraction" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
 
-    try testing.expect(parsed == .float);
-    try testing.expectEqual(123.456, parsed.float);
+    try testing.expect(result.ok == .float);
+    try testing.expectEqual(123.456, result.ok.float);
 }
 
 test "Parse exponential plus" {
@@ -563,10 +673,11 @@ test "Parse exponential plus" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
 
-    try testing.expect(parsed == .float);
-    try testing.expectEqual(1.23e+4, parsed.float);
+    try testing.expect(result.ok == .float);
+    try testing.expectEqual(1.23e+4, result.ok.float);
 }
 
 test "Parse exponential negative" {
@@ -576,10 +687,11 @@ test "Parse exponential negative" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
 
-    try testing.expect(parsed == .float);
-    try testing.expectEqual(1.23e-4, parsed.float);
+    try testing.expect(result.ok == .float);
+    try testing.expectEqual(1.23e-4, result.ok.float);
 }
 
 test "Parse array" {
@@ -589,13 +701,16 @@ test "Parse array" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
 
-    try testing.expect(parsed == .array);
-    try testing.expectEqual(3, parsed.array.items.len);
-    const first_elemet = parsed.array.items[0].integer;
-    const second_element = parsed.array.items[1].integer;
-    const third_elemet = parsed.array.items[2].integer;
+    try testing.expect(result.ok == .array);
+
+    try testing.expectEqual(3, result.ok.array.items.len);
+    const first_elemet = result.ok.array.items[0].integer;
+    const second_element = result.ok.array.items[1].integer;
+    const third_elemet = result.ok.array.items[2].integer;
+
     try testing.expectEqual(1, first_elemet);
     try testing.expectEqual(2, second_element);
     try testing.expectEqual(3, third_elemet);
@@ -608,15 +723,50 @@ test "Parse array has string" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
+    try testing.expect(result.ok == .array);
 
-    try testing.expect(parsed == .array);
-    try testing.expectEqual(2, parsed.array.items.len);
-    const first_elemet = parsed.array.items[0].string;
-    const second_element = parsed.array.items[1].string;
+    try testing.expectEqual(2, result.ok.array.items.len);
+    const first_elemet = result.ok.array.items[0].string;
+    const second_element = result.ok.array.items[1].string;
 
     try testing.expectEqualStrings("hello", first_elemet);
     try testing.expectEqualStrings("world", second_element);
+}
+
+test "Parse array has 0 length string" {
+    const input = "[\"hello\", \"\"]";
+    const allocator = testing.allocator;
+
+    var parser = try JsoncParser.init(allocator, input);
+    defer parser.deinit();
+
+    const result = parser.parse();
+    try testing.expect(result == .ok);
+    try testing.expect(result.ok == .array);
+
+    try testing.expectEqual(2, result.ok.array.items.len);
+    const first_elemet = result.ok.array.items[0].string;
+    const second_element = result.ok.array.items[1].string;
+
+    try testing.expectEqualStrings("hello", first_elemet);
+    try testing.expectEqualStrings("", second_element);
+}
+
+test "Parse array with empty element" {
+    const input = "[1, , 3]";
+    const allocator = testing.allocator;
+
+    var parser = try JsoncParser.init(allocator, input);
+    defer parser.deinit();
+
+    const result = parser.parse();
+    try testing.expect(result == .err);
+
+    try testing.expectEqual(ParseError.EmptyElemnt, result.err.kind);
+    try testing.expectEqual(1, result.err.row);
+    try testing.expectEqual(5, result.err.col);
 }
 
 test "Parse object" {
@@ -631,11 +781,87 @@ test "Parse object" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
+    try testing.expect(result.ok == .object);
 
-    try testing.expect(parsed == .object);
-    try testing.expectEqualStrings("zig", parsed.object.get("lang").?.string);
-    try testing.expectEqual(0.14, parsed.object.get("version").?.float);
+    try testing.expectEqualStrings("zig", result.ok.object.get("lang").?.string);
+    try testing.expectEqual(0.14, result.ok.object.get("version").?.float);
+}
+
+test "Parse string with escape sequences" {
+    const input =
+        \\{
+        \\  "message": "Hello\nWorld",
+        \\  "path": "C:\\Users\\file.txt",
+        \\  "quote": "He said \"Hello\"",
+        \\  "tab": "Name:\tValue",
+        \\  "slash": "https:\/\/example.com"
+        \\}
+    ;
+    const allocator = testing.allocator;
+
+    var parser = try JsoncParser.init(allocator, input);
+    defer parser.deinit();
+
+    const result = parser.parse();
+    try testing.expect(result == .ok);
+    try testing.expect(result.ok == .object);
+
+    // Test newline escape
+    try testing.expectEqualStrings("Hello\nWorld", result.ok.object.get("message").?.string);
+
+    // Test backslash escape
+    try testing.expectEqualStrings("C:\\Users\\file.txt", result.ok.object.get("path").?.string);
+
+    // Test quote escape
+    try testing.expectEqualStrings("He said \"Hello\"", result.ok.object.get("quote").?.string);
+
+    // Test tab escape
+    try testing.expectEqualStrings("Name:\tValue", result.ok.object.get("tab").?.string);
+
+    // Test forward slash escape
+    try testing.expectEqualStrings("https://example.com", result.ok.object.get("slash").?.string);
+}
+
+test "Parse object with unterminated string value" {
+    const input =
+        \\{
+        \\  "lang": "zig,
+        \\  "version" : 0.14
+        \\}
+    ;
+    const allocator = testing.allocator;
+
+    var parser = try JsoncParser.init(allocator, input);
+    defer parser.deinit();
+
+    const result = parser.parse();
+    try testing.expect(result == .err);
+
+    try testing.expectEqual(ParseError.UnterminatedString, result.err.kind);
+    try testing.expectEqual(2, result.err.row);
+    try testing.expectEqual(15, result.err.col);
+}
+
+test "Parse object with unopened string value" {
+    const input =
+        \\{
+        \\  "lang": zig",
+        \\  "version" : 0.14
+        \\}
+    ;
+    const allocator = testing.allocator;
+
+    var parser = try JsoncParser.init(allocator, input);
+    defer parser.deinit();
+
+    const result = parser.parse();
+    try testing.expect(result == .err);
+
+    try testing.expectEqual(ParseError.UnexpectedCharacter, result.err.kind);
+    try testing.expectEqual(2, result.err.row);
+    try testing.expectEqual(11, result.err.col);
 }
 
 test "Parse object with empty line at first" {
@@ -651,11 +877,32 @@ test "Parse object with empty line at first" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
+    try testing.expect(result.ok == .object);
 
-    try testing.expect(parsed == .object);
-    try testing.expectEqualStrings("zig", parsed.object.get("lang").?.string);
-    try testing.expectEqual(0.14, parsed.object.get("version").?.float);
+    try testing.expectEqualStrings("zig", result.ok.object.get("lang").?.string);
+    try testing.expectEqual(0.14, result.ok.object.get("version").?.float);
+}
+
+test "Parse object missing commma between value and next key" {
+    const input =
+        \\{
+        \\  "lang": "zig"
+        \\  "version" : 0.14
+        \\}
+    ;
+    const allocator = testing.allocator;
+
+    var parser = try JsoncParser.init(allocator, input);
+    defer parser.deinit();
+
+    const result = parser.parse();
+    try testing.expect(result == .err);
+
+    try testing.expectEqual(ParseError.MissingComma, result.err.kind);
+    try testing.expectEqual(3, result.err.row);
+    try testing.expectEqual(3, result.err.col);
 }
 
 test "Parse object has string array" {
@@ -670,18 +917,39 @@ test "Parse object has string array" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
+    try testing.expect(result.ok == .object);
 
-    try testing.expect(parsed == .object);
-    try testing.expectEqualStrings("English", parsed.object.get("lang").?.string);
-    try testing.expectEqual(3, parsed.object.get("greeting").?.array.items.len);
-    try testing.expectEqualStrings("Good morning", parsed.object.get("greeting").?.array.items[0].string);
-    try testing.expectEqualStrings("Hello", parsed.object.get("greeting").?.array.items[1].string);
-    try testing.expectEqualStrings("Good evening", parsed.object.get("greeting").?.array.items[2].string);
+    try testing.expectEqualStrings("English", result.ok.object.get("lang").?.string);
+    try testing.expectEqual(3, result.ok.object.get("greeting").?.array.items.len);
+    try testing.expectEqualStrings("Good morning", result.ok.object.get("greeting").?.array.items[0].string);
+    try testing.expectEqualStrings("Hello", result.ok.object.get("greeting").?.array.items[1].string);
+    try testing.expectEqualStrings("Good evening", result.ok.object.get("greeting").?.array.items[2].string);
+}
+
+test "Parse object has unterminated array" {
+    const input =
+        \\{
+        \\  "lang": "English",
+        \\  "greeting": [  "Good morning" , "Hello", "Good evening"
+        \\}
+    ;
+    const allocator = testing.allocator;
+
+    var parser = try JsoncParser.init(allocator, input);
+    defer parser.deinit();
+
+    const result = parser.parse();
+    try testing.expect(result == .err);
+
+    try testing.expectEqual(ParseError.UnterminatedArray, result.err.kind);
+    try testing.expectEqual(3, result.err.row);
+    try testing.expectEqual(15, result.err.col);
 }
 
 test "Parse object with comment" {
-    const input = 
+    const input =
         \\ {
         \\     "lang": "zig", // general-purpose programming language
         \\     "version": 0.14
@@ -692,11 +960,12 @@ test "Parse object with comment" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = parser.parse();
+    try testing.expect(result == .ok);
+    try testing.expect(result.ok == .object);
 
-    try testing.expect(parsed == .object);
-    try testing.expectEqualStrings("zig", parsed.object.get("lang").?.string);
-    try testing.expectEqual(0.14, parsed.object.get("version").?.float);
+    try testing.expectEqualStrings("zig", result.ok.object.get("lang").?.string);
+    try testing.expectEqual(0.14, result.ok.object.get("version").?.float);
 }
 
 test "Parse object with multi-line comment" {
@@ -713,18 +982,16 @@ test "Parse object with multi-line comment" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = parser.parse() catch |err| {
-        std.debug.print("{c}\n", .{parser.jsonc_str[parser.idx]});
-        return err;
-    };
+    const result = parser.parse();
+    try testing.expect(result == .ok);
+    try testing.expect(result.ok == .object);
 
-    try testing.expect(parsed == .object);
-    try testing.expectEqualStrings("zig", parsed.object.get("lang").?.string);
-    try testing.expectEqual(0.14, parsed.object.get("version").?.float);
+    try testing.expectEqualStrings("zig", result.ok.object.get("lang").?.string);
+    try testing.expectEqual(0.14, result.ok.object.get("version").?.float);
 }
 
 test "Parse nested object" {
-    const input = 
+    const input =
         \\{
         \\    "music": {
         \\        "theme": {
@@ -744,22 +1011,20 @@ test "Parse nested object" {
     var parser = try JsoncParser.init(allocator, input);
     defer parser.deinit();
 
-    const parsed = parser.parse() catch |err| {
-        std.debug.print("{c}\n", .{parser.jsonc_str[parser.idx]});
-        return err;
-    };
+    const result = parser.parse();
+    try testing.expect(result == .ok);
+    try testing.expect(result.ok == .object);
 
-    try testing.expect(parsed == .object);
-    const music = parsed.object.get("music").?;
+    const music = result.ok.object.get("music").?;
     try testing.expect(music == .object);
-    
+
     const theme = music.object.get("theme").?;
     try testing.expect(theme == .object);
 
     const color = theme.object.get("color").?;
     try testing.expectEqualStrings("#8a2be2", color.string);
 
-    const messages = parsed.object.get("messages").?;
+    const messages = result.ok.object.get("messages").?;
     try testing.expect(messages == .array);
 
     try testing.expectEqual(3, messages.array.items.len);
