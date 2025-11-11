@@ -58,11 +58,12 @@ test "Parse object with comment" {
     // Be sure to call parser.deinit() when your're done.
     defer parser.deinit();
 
-    const parsed = try parser.parse();
+    const result = try parser.parse();
 
-    try testing.expect(parsed == .object);
-    try testing.expectEqualStrings("zig", parsed.object.get("lang").?.string);
-    try testing.expectEqual(0.14, parsed.object.get("version").?.float);
+    try testing.expect(parsed == .ok);
+    try testing.expect(parsed.ok == .object);
+    try testing.expectEqualStrings("zig", parsed.ok.object.get("lang").?.string);
+    try testing.expectEqual(0.14, parsed.ok.object.get("version").?.float);
 }
 
 const std = @import("std");
